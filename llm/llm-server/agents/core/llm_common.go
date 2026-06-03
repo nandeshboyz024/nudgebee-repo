@@ -2253,6 +2253,37 @@ func isRetryableError(err error) bool {
 	return isTokenLimitError(err) || isQuotaError(err) || isTransientError(err) || isEmptyResponseError(err) || isCacheError(err) || isProgramError(err)
 }
 
+// classifyUserFacingLLMError maps an internal LLM error to a typed, HTTP-coded,
+// user-safe error (one of the ErrLLM* values) for the known failure modes,
+// using the same detectors that drive the retry/fallback logic. Returning the
+// typed error lets it propagate through the normal error path so the executor
+// surfaces its clean Message as the assistant reply with the right status code,
+// instead of a generic "internal error".
+//
+// Returns nil when the error doesn't match a known class, so callers fall back
+// to their existing generic handling (and never leak the raw provider error).
+func classifyUserFacingLLMError(err error) error {
+	// Order matters: the quota/throttle check MUST come before the token-limit
+	// check. AWS Bedrock surfaces 429 throttling as a wrapped "token limit
+	// error ... ThrottlingException: Too many tokens" string that matches both
+	// isQuotaError and isTokenLimitError. It is a capacity event, not a
+	// context-window overflow, so it must be classified as rate-limited —
+	// otherwise the user is wrongly told to shorten a request that was the
+	// right size.
+	switch {
+	case err == nil:
+		return nil
+	case isQuotaError(err):
+		return ErrLLMRateLimited
+	case isTokenLimitError(err):
+		return ErrLLMRequestTooLarge
+	case isTransientError(err):
+		return ErrLLMServiceUnavailable
+	default:
+		return nil
+	}
+}
+
 // syncModelWithContextOverrides returns the effective provider and model for an LLM call,
 // accounting for runtime context keys that may have changed the llm client from what the
 // config-based resolution returned. It must be called after the config-based resolution so
