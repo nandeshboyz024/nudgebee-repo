@@ -17,6 +17,8 @@ import (
 	"nudgebee/services/tenant"
 	"strings"
 	"time"
+
+	"github.com/jmoiron/sqlx"
 )
 
 const dateTimeFormat = "2006-01-02 15:04:05"
@@ -160,6 +162,7 @@ func executeForAccountPairs(ctx *security.RequestContext, pairs []accountTenantP
 	}
 
 	var workItems []processingWorkItem
+	eligibleAccountIds := make([]string, 0, len(pairs))
 	slog.Info("anomaly: generating work items...", "accountCount", len(pairs))
 
 	for _, pair := range pairs {
@@ -173,6 +176,7 @@ func executeForAccountPairs(ctx *security.RequestContext, pairs []accountTenantP
 			continue
 		}
 
+		eligibleAccountIds = append(eligibleAccountIds, pair.AccountID)
 		for _, app := range apps {
 			for _, cfg := range allAnomalyConfigs {
 				workItems = append(workItems, processingWorkItem{
@@ -189,6 +193,10 @@ func executeForAccountPairs(ctx *security.RequestContext, pairs []accountTenantP
 		slog.Info("anomaly: no work items generated for processing.")
 		return nil
 	}
+
+	// Pre-fetch existing anomaly counts for all eligible accounts in a single query,
+	// instead of running a COUNT(*) per (app × anomaly_type) inside the loop.
+	existingAnomalyCounts := fetchExistingAnomalyCounts(eligibleAccountIds)
 
 	// Shuffle the workItems slice to distribute load
 	source := rand.NewSource(time.Now().UnixNano())
@@ -210,7 +218,11 @@ func executeForAccountPairs(ctx *security.RequestContext, pairs []accountTenantP
 		if item.AnomalyConfig.AnomalyProvider == "prometheus" {
 			processingErr = processSingleApplicationPrometheus(ctx, item.AnomalyConfig, item.TenantID, item.AccountID, item.Application)
 		} else {
-			processingErr = processSingleApplicationMlAsync(ctx, item.AnomalyConfig, item.TenantID, item.AccountID, item.Application)
+			var existingCount int
+			if typeCounts, ok := existingAnomalyCounts[item.AccountID]; ok {
+				existingCount = typeCounts[item.AnomalyConfig.AnomalyType]
+			}
+			processingErr = processSingleApplicationMlAsync(ctx, item.AnomalyConfig, item.TenantID, item.AccountID, item.Application, existingCount)
 		}
 
 		if processingErr != nil {
@@ -223,12 +235,75 @@ func executeForAccountPairs(ctx *security.RequestContext, pairs []accountTenantP
 	return nil
 }
 
+// fetchExistingAnomalyCounts returns a nested map[accountId][anomalyType] -> count of
+// existing rows in the `anomaly` table. A single grouped query replaces what used to be
+// one COUNT(*) per (app × anomalyType) inside the work-item loop.
+// Missing entries (no rows for an account/type) implicitly read back as 0.
+func fetchExistingAnomalyCounts(accountIds []string) map[string]map[AnomalyType]int {
+	result := make(map[string]map[AnomalyType]int, len(accountIds))
+
+	// Drop empty IDs defensively — an empty account_id in IN (...) would scan rows
+	// belonging to other tenants/accounts, which the surrounding code never intends.
+	nonEmptyAccountIds := make([]string, 0, len(accountIds))
+	for _, id := range accountIds {
+		if id != "" {
+			nonEmptyAccountIds = append(nonEmptyAccountIds, id)
+		}
+	}
+	if len(nonEmptyAccountIds) == 0 {
+		return result
+	}
+
+	dbms, err := database.GetDatabaseManager(database.Metastore)
+	if err != nil {
+		slog.Error("anomaly: failed to get db manager for existing anomaly counts", "error", err)
+		return result
+	}
+
+	query, args, err := sqlx.In(`SELECT account_id, anomaly_type, COUNT(*) FROM anomaly WHERE account_id IN (?) GROUP BY account_id, anomaly_type`, nonEmptyAccountIds)
+	if err != nil {
+		slog.Error("anomaly: failed to build existing-anomaly-counts query", "error", err)
+		return result
+	}
+	query = dbms.Db.Rebind(query)
+
+	rows, err := dbms.Db.Queryx(query, args...)
+	if err != nil {
+		slog.Error("anomaly: failed to query existing anomaly counts", "error", err)
+		return result
+	}
+	defer func() {
+		if cerr := rows.Close(); cerr != nil {
+			slog.Error("anomaly: failed to close existing-anomaly-counts rows", "error", cerr)
+		}
+	}()
+
+	for rows.Next() {
+		var accountID string
+		var anomalyType AnomalyType
+		var count int
+		if err := rows.Scan(&accountID, &anomalyType, &count); err != nil {
+			slog.Error("anomaly: failed to scan existing anomaly count row", "error", err)
+			continue
+		}
+		if _, ok := result[accountID]; !ok {
+			result[accountID] = make(map[AnomalyType]int)
+		}
+		result[accountID][anomalyType] = count
+	}
+	if err := rows.Err(); err != nil {
+		slog.Error("anomaly: error iterating existing-anomaly-counts rows", "error", err)
+	}
+	return result
+}
+
 func processSingleApplicationMlAsync(
 	ctx *security.RequestContext,
 	anomalyConfig AnomalyTemplate,
 	tenantId string,
 	accountId string,
 	app application.Application, // Single application
+	existingAnomalyCount int, // pre-fetched count of existing anomalies for (accountId, anomalyType)
 ) error {
 	slog.Debug("anomaly: processing ML config for single application",
 		"accountId", accountId, "tenantId", tenantId, "app", app.Name, "namespace", app.K8sNamespace, "anomalyType", anomalyConfig.AnomalyType)
@@ -248,38 +323,6 @@ func processSingleApplicationMlAsync(
 	// Time range for anomaly detection
 	endTime := time.Now().UTC().Truncate(time.Hour)
 	startTime := endTime.AddDate(0, 0, -1*config.Config.NBAnomalyTrainingDays)
-
-	// Get database manager
-	dbms, err := database.GetDatabaseManager(database.Metastore)
-	if err != nil {
-		slog.Error("anomaly: failed to get db manager for ML processing", "error", err, "app", app.Name, "accountId", accountId)
-		return err
-	}
-
-	// Query the count of existing anomalies
-	rows, err := dbms.Query(`select count(*) from anomaly where account_id = $1 and anomaly_type = $2`, accountId, anomalyConfig.AnomalyType)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		err := rows.Close()
-		if err != nil {
-			slog.Error("anomaly: failed to close rows", "error", err)
-		}
-	}()
-
-	var existingAnomalyCount int
-	if rows.Next() {
-		err = rows.Scan(&existingAnomalyCount)
-		if err != nil {
-			slog.Error("anomaly: failed to scan existing anomaly count for ML", "error", err, "accountId", accountId)
-			return err
-		}
-	}
-	if err = rows.Err(); err != nil {
-		slog.Error("anomaly: error after scanning existing anomaly count for ML", "error", err, "accountId", accountId)
-		return err
-	}
 
 	// Set evaluation period minutes
 	var evaluationPeriodMinutes = config.Config.NBAnomalyEvaluationHours * 60
@@ -303,7 +346,7 @@ func processSingleApplicationMlAsync(
 	slog.Info("anomaly: publishing ML processing message for app",
 		"accountId", accountId, "tenantId", tenantId, "app", app.Name, "namespace", app.K8sNamespace, "type", anomalyConfig.AnomalyType)
 
-	err = common.MqPublish(config.Config.RabbitMqServicesExchange, config.Config.RabbitMqServicesAnomalyProcessingQueue, AnomalyProcessingMessage{
+	err := common.MqPublish(config.Config.RabbitMqServicesExchange, config.Config.RabbitMqServicesAnomalyProcessingQueue, AnomalyProcessingMessage{
 		TenantId:                tenantId,
 		AccountId:               accountId,
 		ApplicationName:         app.Name,
