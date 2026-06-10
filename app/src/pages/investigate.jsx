@@ -875,11 +875,6 @@ const Investigate = () => {
     apiRecommendations.listEventResolutions(id).then((resolutions) => {
       if (!cancelled && isMountedRef.current) setEventResolutions(resolutions);
     });
-    if (router.query.accountId) {
-      apiWorkflow.listExecutionsForEvent(router.query.accountId, id).then((resp) => {
-        if (!cancelled && isMountedRef.current) setTriggeredExecutions(resp?.data?.executions || []);
-      });
-    }
     return () => {
       cancelled = true;
     };
@@ -893,9 +888,14 @@ const Investigate = () => {
   useEffect(() => {
     let cancelled = false;
     if (row.id) {
+      // Resolve the account id from the loaded event row. K8s events carry no
+      // accountId in the URL, so gating on router.query.accountId alone skipped
+      // this fetch and hid the "Triggered for this event" list for them.
+      const eventAccountId = row.cloud_account_id || router.query.accountId;
+
       apiAskNudgebee
         .getFeedbackForSessionId({
-          account_id: row.cloud_account_id || router.query.accountId,
+          account_id: eventAccountId,
           session_id: row.id,
         })
         .then((res) => {
@@ -909,6 +909,12 @@ const Investigate = () => {
             });
           }
         });
+
+      if (eventAccountId) {
+        apiWorkflow.listExecutionsForEvent(eventAccountId, row.id).then((resp) => {
+          if (!cancelled && isMountedRef.current) setTriggeredExecutions(resp?.data?.executions || []);
+        });
+      }
 
       if (row?.fingerprint) {
         getTicketData();
